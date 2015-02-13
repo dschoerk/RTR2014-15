@@ -1,0 +1,1 @@
+pandoc -o readme.pdf readme.txt

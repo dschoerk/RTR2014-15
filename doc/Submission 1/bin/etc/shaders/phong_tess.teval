@@ -1,0 +1,64 @@
+#version 430 core
+
+layout(triangles, fractional_odd_spacing, ccw) in;
+
+in vec3 tcPosition[];
+in vec3 tcNormal[];
+in vec2 tcTexcoord[];
+
+out vec3 tePosition;
+out vec3 teNormal;
+out vec3 tePatchDistance;
+out vec2 teTexcoord;
+//out vec4 shadow_coord;
+
+uniform mat4 gWVP;
+uniform mat4 gWorld;
+uniform mat3 gNormal;
+uniform sampler2D normal; 
+
+vec3 interpolate3D(vec3 v0, vec3 v1, vec3 v2);
+vec2 interpolate2D(vec2 v0, vec2 v1, vec2 v2);
+
+vec3 getNormal(vec3 n, vec2 tc)
+{
+	vec3 tn = texture(normal, tc).xyz;	
+	vec3 up = vec3(0,1,0);
+	vec3 tangent = normalize(cross(up, tn));
+	vec3 bitangent = normalize(cross(tn, tangent));
+	mat3 tbn = mat3(tangent,bitangent,tn);
+	return transpose(tbn) * n;
+}
+	
+void main()
+{
+	tePosition = interpolate3D(tcPosition[0],tcPosition[1],tcPosition[2]);
+	
+	vec3 n0 = normalize(getNormal(tcNormal[0], tcTexcoord[0]));
+	vec3 n1 = normalize(getNormal(tcNormal[1], tcTexcoord[1]));
+	vec3 n2 = normalize(getNormal(tcNormal[2], tcTexcoord[2]));
+
+	teNormal = gNormal * interpolate3D(n0,n1,n2);
+
+	// resample normal from texture ?
+	vec3 pi0 = tePosition-dot(tePosition-tcPosition[0],n0)*n0;
+	vec3 pi1 = tePosition-dot(tePosition-tcPosition[1],n1)*n1;
+	vec3 pi2 = tePosition-dot(tePosition-tcPosition[2],n2)*n2;
+	vec3 phongPos = interpolate3D(pi0,pi1,pi2);
+
+    tePatchDistance = gl_TessCoord;
+	teTexcoord = interpolate2D(tcTexcoord[0], tcTexcoord[1], tcTexcoord[2]);
+
+	//shadow_coord = depthVPMatrix * vec4(phongPos,1);
+    gl_Position = gWVP * vec4(phongPos,1);
+}
+
+vec2 interpolate2D(vec2 v0, vec2 v1, vec2 v2)
+{
+   	 return vec2(gl_TessCoord.x) * v0 + vec2(gl_TessCoord.y) * v1 + vec2(gl_TessCoord.z) * v2;
+}
+
+vec3 interpolate3D(vec3 v0, vec3 v1, vec3 v2)
+{
+   	 return vec3(gl_TessCoord.x) * v0 + vec3(gl_TessCoord.y) * v1 + vec3(gl_TessCoord.z) * v2;
+}

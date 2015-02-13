@@ -1,0 +1,14 @@
+# Blender MTL File: 'hellknight_draft.blend'
+# Material Count: 1
+
+newmtl Material.004
+Ns 119.607843
+Ka 0.000000 0.000000 0.000000
+Kd 0.618217 0.613015 0.640000
+Ks 0.195652 0.195652 0.195652
+Ni 1.000000
+d 1.000000
+illum 2
+map_Kd textures\hellknight.jpg
+map_Ks textures\\hellknight_s.jpg
+map_Bump textures\\hellknight_local_yinv.jpg

@@ -1,0 +1,734 @@
+
+#include <iostream>
+#include <glm/detail/type_vec3.hpp>
+
+#include <assimp/Importer.hpp>
+#include <assimp/scene.h>
+#include <assimp/postprocess.h>
+
+#include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp> 
+#include <glm/gtx/quaternion.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <FreeImage.h>
+
+#include <irrKlang.h>
+
+#include <CandyApplication.h>
+#include <Scene/Pointlight.h>
+#include <GL/GLShader.h>
+#include <GL/GLProgram.h>
+#include <PrimitiveGenerator.h>
+
+#include <memory>
+#include <VertexFormat.h>
+#include <GeometryBuffer.h>
+#include <Geometry.h>
+#include <DeferredPipeline.h>
+#include <MeshLoader.h>
+#include "utils.h"
+#include "INIReader.h"
+
+#include <sstream>
+#include <fstream>
+#include <map>
+
+
+
+
+void copy_mat(const aiMatrix4x4 *from, glm::mat4 &to)
+{
+  to[0][0] = from->a1; to[1][0] = from->a2;
+  to[2][0] = from->a3; to[3][0] = from->a4;
+  to[0][1] = from->b1; to[1][1] = from->b2;
+  to[2][1] = from->b3; to[3][1] = from->b4;
+  to[0][2] = from->c1; to[1][2] = from->c2;
+  to[2][2] = from->c3; to[3][2] = from->c4;
+  to[0][3] = from->d1; to[1][3] = from->d2;
+  to[2][3] = from->d3; to[3][3] = from->d4;
+}
+
+glm::vec3 bezier(const std::vector<glm::vec3>& points, int startIdx, float t)
+{
+  return (1.f - t) * (1.f - t) * (1.f - t) * points[startIdx] + 3.f * t * (1.f - t) * (1.f - t) * points[startIdx + 1] + 3.f * t * t * (1.f - t) * points[startIdx + 2] + t * t * t * points[startIdx + 3];
+}
+
+uint FindPosition(float AnimationTime, const aiNodeAnim* pNodeAnim)
+{
+  for (uint i = 0; i < pNodeAnim->mNumPositionKeys - 1; i++) {
+    if (AnimationTime < (float)pNodeAnim->mPositionKeys[i + 1].mTime) {
+      return i;
+    }
+  }
+
+  assert(0);
+
+  return 0;
+}
+
+
+uint FindRotation(float AnimationTime, const aiNodeAnim* pNodeAnim)
+{
+  assert(pNodeAnim->mNumRotationKeys > 0);
+
+  for (uint i = 0; i < pNodeAnim->mNumRotationKeys - 1; i++) {
+    if (AnimationTime < (float)pNodeAnim->mRotationKeys[i + 1].mTime) {
+      return i;
+    }
+  }
+
+  assert(0);
+
+  return 0;
+}
+
+
+uint FindScaling(float AnimationTime, const aiNodeAnim* pNodeAnim)
+{
+  assert(pNodeAnim->mNumScalingKeys > 0);
+
+  for (uint i = 0; i < pNodeAnim->mNumScalingKeys - 1; i++) {
+    if (AnimationTime < (float)pNodeAnim->mScalingKeys[i + 1].mTime) {
+      return i;
+    }
+  }
+
+  assert(0);
+
+  return 0;
+}
+
+void CalcInterpolatedPosition(aiVector3D& Out, float AnimationTime, const aiNodeAnim* pNodeAnim)
+{
+  if (pNodeAnim->mNumPositionKeys == 1) {
+    Out = pNodeAnim->mPositionKeys[0].mValue;
+    return;
+  }
+
+  uint PositionIndex = FindPosition(AnimationTime, pNodeAnim);
+  uint NextPositionIndex = (PositionIndex + 1);
+  assert(NextPositionIndex < pNodeAnim->mNumPositionKeys);
+  float DeltaTime = (float)(pNodeAnim->mPositionKeys[NextPositionIndex].mTime - pNodeAnim->mPositionKeys[PositionIndex].mTime);
+  float Factor = (AnimationTime - (float)pNodeAnim->mPositionKeys[PositionIndex].mTime) / DeltaTime;
+  assert(Factor >= 0.0f && Factor <= 1.0f);
+  const aiVector3D& Start = pNodeAnim->mPositionKeys[PositionIndex].mValue;
+  const aiVector3D& End = pNodeAnim->mPositionKeys[NextPositionIndex].mValue;
+  aiVector3D Delta = End - Start;
+  Out = Start + Factor * Delta;
+}
+
+void CalcInterpolatedRotation(glm::mat4& Out, float AnimationTime, const aiNodeAnim* pNodeAnim)
+{
+  // we need at least two values to interpolate...
+  if (pNodeAnim->mNumRotationKeys == 1) 
+  {
+    const auto& q = pNodeAnim->mRotationKeys[0].mValue;
+    glm::quat gq(q.x, q.y, q.z, q.w);
+    Out = glm::mat4_cast(gq);
+    return;
+  }
+
+  uint RotationIndex = FindRotation(AnimationTime, pNodeAnim);
+  uint NextRotationIndex = (RotationIndex + 1);
+  assert(NextRotationIndex < pNodeAnim->mNumRotationKeys);
+  float DeltaTime = (float)(pNodeAnim->mRotationKeys[NextRotationIndex].mTime - pNodeAnim->mRotationKeys[RotationIndex].mTime);
+  float Factor = (AnimationTime - (float)pNodeAnim->mRotationKeys[RotationIndex].mTime) / DeltaTime;
+  assert(Factor >= 0.0f && Factor <= 1.0f);
+  
+  const aiQuaternion& StartRotationQ = pNodeAnim->mRotationKeys[RotationIndex].mValue;
+  const aiQuaternion& EndRotationQ = pNodeAnim->mRotationKeys[NextRotationIndex].mValue;
+  const glm::quat start(StartRotationQ.w, StartRotationQ.x, StartRotationQ.y, StartRotationQ.z);
+  const glm::quat end(EndRotationQ.w, EndRotationQ.x, EndRotationQ.y, EndRotationQ.z);
+
+  const glm::vec3 dirStart = glm::eulerAngles(start);
+  const glm::vec3 dirEnd = glm::eulerAngles(end);
+
+  glm::quat rot = glm::shortMix(start, end, Factor);
+  //aiQuaternion::Interpolate(Out, StartRotationQ, EndRotationQ, Factor);
+  Out = glm::mat4_cast(rot);
+}
+
+
+void CalcInterpolatedScaling(aiVector3D& Out, float AnimationTime, const aiNodeAnim* pNodeAnim)
+{
+  if (pNodeAnim->mNumScalingKeys == 1) {
+    Out = pNodeAnim->mScalingKeys[0].mValue;
+    return;
+  }
+
+  uint ScalingIndex = FindScaling(AnimationTime, pNodeAnim);
+  uint NextScalingIndex = (ScalingIndex + 1);
+  assert(NextScalingIndex < pNodeAnim->mNumScalingKeys);
+  float DeltaTime = (float)(pNodeAnim->mScalingKeys[NextScalingIndex].mTime - pNodeAnim->mScalingKeys[ScalingIndex].mTime);
+  float Factor = (AnimationTime - (float)pNodeAnim->mScalingKeys[ScalingIndex].mTime) / DeltaTime;
+  assert(Factor >= 0.0f && Factor <= 1.0f);
+  const aiVector3D& Start = pNodeAnim->mScalingKeys[ScalingIndex].mValue;
+  const aiVector3D& End = pNodeAnim->mScalingKeys[NextScalingIndex].mValue;
+  aiVector3D Delta = End - Start;
+  Out = Start + Factor * Delta;
+}
+
+const aiNodeAnim* FindNodeAnim(const aiAnimation* pAnimation, const string NodeName)
+{
+  for (uint i = 0; i < pAnimation->mNumChannels; i++) {
+    const aiNodeAnim* pNodeAnim = pAnimation->mChannels[i];
+
+    if (string(pNodeAnim->mNodeName.data) == NodeName) {
+      return pNodeAnim;
+    }
+  }
+
+  return NULL;
+}
+
+glm::mat4 globalInverse;
+
+void ReadNodeHeirarchy(aiAnimation* pAnimation, float AnimationTime, const aiNode* pNode, const glm::mat4& ParentTransform, const std::vector<std::string>& bonenames, const std::vector<glm::mat4>& inversePoses, std::vector<glm::mat4>& finalTransformation)
+{
+  string NodeName(pNode->mName.data);
+
+  glm::mat4 NodeTransformation(1.f);
+  copy_mat(&pNode->mTransformation, NodeTransformation);
+
+  const aiNodeAnim* pNodeAnim = FindNodeAnim(pAnimation, NodeName);
+
+  if (pNodeAnim) 
+  {
+    // Interpolate scaling and generate scaling transformation matrix
+    aiVector3D Scaling;
+    CalcInterpolatedScaling(Scaling, AnimationTime, pNodeAnim);
+    glm::mat4 ScalingM = glm::scale(glm::mat4(1.0f), glm::vec3(Scaling.x, Scaling.y, Scaling.z));
+
+    // Interpolate rotation and generate rotation transformation matrix
+    glm::mat4 RotationM;
+    CalcInterpolatedRotation(RotationM, AnimationTime, pNodeAnim);
+    
+    // Interpolate translation and generate translation transformation matrix
+    aiVector3D Translation;
+    CalcInterpolatedPosition(Translation, AnimationTime, pNodeAnim);
+    glm::mat4 TranslationM = glm::translate(glm::mat4(1.f), glm::vec3(Translation.x, Translation.y, Translation.z));
+    
+    // Combine the above transformations
+    NodeTransformation = TranslationM * RotationM * ScalingM;
+  }
+
+  int BoneIndex = find(bonenames.begin(), bonenames.end(), NodeName) - bonenames.begin();
+
+  //REMOVE ME
+//  if (BoneIndex < 40)
+  //NodeTransformation = glm::mat4(1);// glm::inverse(inversePoses[BoneIndex]);
+
+  glm::mat4 GlobalTransformation = ParentTransform * NodeTransformation;
+
+
+  if (BoneIndex < 40) // TODO: remove magic number!!!!!!!!!!
+  {
+    //uint BoneIndex = m_BoneMapping[NodeName];
+    finalTransformation[BoneIndex] = globalInverse * GlobalTransformation * inversePoses[BoneIndex];
+  }
+
+  for (uint i = 0; i < pNode->mNumChildren; i++) 
+  {
+    ReadNodeHeirarchy(pAnimation, AnimationTime, pNode->mChildren[i], GlobalTransformation, bonenames, inversePoses, finalTransformation);
+  }
+}
+
+void BoneTransform(aiAnimation* pAnimation, aiNode* root, float TimeInSeconds, const std::vector<std::string>& bonenames, const std::vector<glm::mat4>& inversePoses, std::vector<glm::mat4>& finalTransformation)
+{
+  /*Matrix4f Identity;
+  Identity.InitIdentity();*/
+
+  float TicksPerSecond = pAnimation->mTicksPerSecond != 0 ? pAnimation->mTicksPerSecond : 25.0f;
+  float TimeInTicks = TimeInSeconds * TicksPerSecond / 2.0f;
+  float AnimationTime = fmod(TimeInTicks, pAnimation->mDuration);
+
+  ReadNodeHeirarchy(pAnimation, AnimationTime, root, glm::mat4(1.f), bonenames, inversePoses, finalTransformation);
+
+/*  Transforms.resize(pAnimation->mNu);
+
+  for (uint i = 0; i < m_NumBones; i++) {
+    Transforms[i] = m_BoneInfo[i].FinalTransformation;
+  }*/
+}
+
+void _check_gl_error(const char *file, int line);
+#define check_gl_error() _check_gl_error(__FILE__,__LINE__)
+void _check_gl_error(const char *file, int line) 
+{
+  GLenum err(glGetError());
+
+  while (err != GL_NO_ERROR) {
+    string error;
+
+    switch (err) {
+    case GL_INVALID_OPERATION:      error = "INVALID_OPERATION";      break;
+    case GL_INVALID_ENUM:           error = "INVALID_ENUM";           break;
+    case GL_INVALID_VALUE:          error = "INVALID_VALUE";          break;
+    case GL_OUT_OF_MEMORY:          error = "OUT_OF_MEMORY";          break;
+    case GL_INVALID_FRAMEBUFFER_OPERATION:  error = "INVALID_FRAMEBUFFER_OPERATION";  break;
+    }
+
+    cerr << "GL_" << error.c_str() << " - " << file << ":" << line << endl;
+    err = glGetError();
+  }
+}
+
+struct Vertex
+{
+  glm::vec3 position;
+  glm::vec3 normal;
+  glm::vec2 texcoord;
+};
+
+struct Vertex2
+{
+  glm::vec3 position;
+  glm::vec3 color;
+};
+
+
+class TestApp : public Candy::CandyApplication
+{
+public:
+  TestApp()
+  {
+	  pSceneShape = nullptr;
+
+    // load the file into the scene
+    const aiScene* pLoadedScene = importer.ReadFile("../etc/gangnamstyle/hellknight_draft.dae", aiProcess_Triangulate | aiProcess_GenSmoothNormals);
+    glm::mat4 globalTransform;
+    const auto tmp = pLoadedScene->mRootNode->mTransformation;
+    copy_mat(&tmp, globalTransform);
+    globalInverse = glm::inverse(globalTransform);
+
+    if (!pLoadedScene)
+    {
+      std::cout << "model loading failed" << std::endl;
+    }
+
+    const auto* _mesh = pLoadedScene->mMeshes[0];
+    anim = pLoadedScene->mAnimations[0];
+    rootnode = pLoadedScene->mRootNode;
+
+    if (_mesh->HasBones())
+    {
+      for (int b = 0; b < _mesh->mNumBones; b++)
+      {
+        aiBone* bone = _mesh->mBones[b];
+        std::cout << bone->mName.C_Str() << std::endl;
+        const aiMatrix4x4 aiInvBindPose = bone->mOffsetMatrix;
+        glm::mat4 invBindPose(1.f);
+        copy_mat(&aiInvBindPose, invBindPose);
+        bones.push_back(invBindPose);
+        bonenames.push_back(bone->mName.C_Str());
+      }
+    }
+
+	//init sound
+	soundEngine = irrklang::createIrrKlangDevice();
+  }
+  ~TestApp()
+  {
+//	  SAFE_DELETE(pbuffer);
+	  // SAFE_DELETE(pSceneShape); ERROR Sadly this pointer got lost somewhere...
+  }
+
+  void loadShaders()
+  {
+	  Candy::GL::GLShader deferred_passtrough_vs("../etc/shaders/deferred_passtrough.vs", Candy::GL::GLShaderType::VERTEX_SHADER);
+	  Candy::GL::GLShader deferred_passtrough_fs("../etc/shaders/deferred_passtrough.fs", Candy::GL::GLShaderType::FRAGMENT_SHADER);
+	  deferred_passthrough_shader.initialize();
+	  deferred_passthrough_shader.attachShader(deferred_passtrough_vs);
+	  deferred_passthrough_shader.attachShader(deferred_passtrough_fs);
+	  deferred_passthrough_shader.link();
+    Candy::GL::GLShader phong_tess_vs("../etc/shaders/phong_tess.vs", Candy::GL::GLShaderType::VERTEX_SHADER);
+    //Candy::GL::GLShader phong_tess_tctrl("../etc/shaders/phong_tess.tctrl", Candy::GL::GLShaderType::TESS_CONTROL_SHADER);
+    //Candy::GL::GLShader phong_tess_teval("../etc/shaders/phong_tess.teval", Candy::GL::GLShaderType::TESS_EVALUATION_SHADER);
+    Candy::GL::GLShader phong_tess_fs("../etc/shaders/phong_tess.fs", Candy::GL::GLShaderType::FRAGMENT_SHADER);
+    phong_tess.initialize();
+    phong_tess.attachShader(phong_tess_vs);
+    //phong_tess.attachShader(phong_tess_tctrl);
+    //phong_tess.attachShader(phong_tess_teval);
+    phong_tess.attachShader(phong_tess_fs);
+    phong_tess.link();
+    phong_tess.setPrimitiveMode(Candy::PrimitiveMode::PATCHES);
+  }
+
+  void initialize() override
+  {
+	  INIReader reader("../etc/config.ini");
+	  if (reader.ParseError() < 0) {
+		  std::cout << "Can't load '../etc/config.ini'\n";
+		  system("PAUSE");
+		  exit(EXIT_FAILURE);
+	  }
+
+	  //screen
+	  bool fullscreen = reader.GetBoolean("start", "fullscreen", true);
+	  width = reader.GetInteger("start", "width", 1024);
+	  height = reader.GetInteger("start", "height", 768);
+	  shadowMapSize = reader.GetInteger("lights", "shadowmapsize", 256);
+
+	  getContext()->createRenderingContext(width, height, fullscreen, "Test1", 4, 4);
+	  loadShaders();
+
+	  pipeline.initialize(width, height);
+
+    sphereMarker = new Candy::GeometryBuffer();
+    Candy::IndexedMesh<Vertex2, unsigned int> tmp_mesh;
+    Candy::PrimitiveGeometry::sphere(tmp_mesh, 10.f, 1);
+	simpleVFormat = new Candy::VertexFormat();
+	simpleVFormat->addVertexElement(0, Candy::FLOAT_VEC3, 0, Candy::POSITION);
+	simpleVFormat->addVertexElement(1, Candy::FLOAT_VEC3, 12, Candy::COLOR);
+    sphereMarker->upload(tmp_mesh.vertices, tmp_mesh.indices);
+
+	  meshLoader = Candy::MeshLoader();
+
+    pHellknight = meshLoader.LoadMesh("../etc/gangnamstyle/hellknight_draft.dae");
+    pHellknight->SetRenderingTechnique(pipeline.GetPassthroughShader());
+
+	  pSceneShape = meshLoader.LoadMesh("../etc/crytek_sponza/sponza.obj");
+    pSceneShape->SetRenderingTechnique(pipeline.GetPassthroughShader());
+
+	InitCamera();
+	InitLights();
+
+
+
+
+//    pSceneShape->SetRenderingTechnique(&phong_tess);
+    check_gl_error();
+
+	  //soundEngine->play2D("../etc/audio/gangnamstyle.ogg", true);
+  }
+
+  void InitLights();
+
+  void InitCamera();
+
+  void update() override
+  {
+	  Candy::RenderDevice* pRenderDevice = getContext();
+      //std::cout << TestApp::getFramesPerSecond() << " FPS " << TestApp::getFrameNumber() << std::endl
+	  if (pRenderDevice->keydown(GLFW_KEY_F5))
+	  {
+		  // ERROR: Loads the shaders multible time because this event gets cought multible times
+		  std::cout << "Reload Shaders" << std::endl;
+		  loadShaders();
+	  }
+
+    //pipeline.ItlInitializeBloom();
+    //loadShaders();
+  }
+
+  void render() override
+  {
+    if (getContext()->IsCameraFreeMoveable())
+    {
+      pCamera->updateKeyboard(getFrameTime());
+    }
+    else if (pCamera->hasPath())
+    {
+      pCamera->updatePath(getAbosulteTime() / 8.0f);
+
+      auto worldMat = glm::inverse(pCamera->getWorldMatrix());
+      auto worldCamPos = worldMat * glm::vec4(0, 0, 0, 1);
+      auto worldCamDir = worldMat * glm::vec4(0, 0, 1, 0);
+
+      /*std::cout << "pos [ " << worldCamPos[0] << ", " << worldCamPos[1] << ", " << worldCamPos[2] << " ]" << std::endl;
+      std::cout << "dir [ " << worldCamDir[0] << ", " << worldCamDir[1] << ", " << worldCamDir[2] << " ]" << std::endl;*/
+    }
+
+    //glm::vec3 pos = bezier(path, 0, fmod<float>(getAbosulteTime() / 8.0f, 1.f));
+    //glm::mat4 pos = hermiteSpline(path_points, path_directions, static_cast<float>(getAbosulteTime()) / 8.0f);
+
+    //auto rotate_mat = glm::rotate(glm::mat4(1.f), fmod<float>(getAbosulteTime() / 8.0f, 360.f), glm::vec3(0, 1, 0));
+    //rotate_mat = glm::translate(glm::mat4(1), pos);
+
+    pipeline.beginGeometryPass();
+    check_gl_error();
+    //    model1 = pos;
+    //pCamera->setPosition(glm::vec3(pos[3][0], pos[3][1], pos[3][2]));
+
+    // draw hellknight
+    auto transform = glm::mat4(1);
+    transform = glm::scale(transform, glm::vec3(25));
+    transform = glm::rotate(transform, -3.1415f / 2.f, glm::vec3(1, 0, 0));
+    transform = glm::rotate(transform, -3.1415f / 2.f, glm::vec3(0, 0, 1));
+    transform = glm::translate(transform, glm::vec3(-1, 15, 0));
+
+    std::vector<glm::mat4> finalTransform(bones.size());
+    BoneTransform(anim, rootnode, getAbosulteTime(), bonenames, bones, finalTransform);
+
+    /*for (int i = 0; i < finalTransform.size(); i++)
+    {
+    pipeline.setMatrices(transform * finalTransform[i] * glm::inverse(bones[i]), pCamera->getWorldMatrix(), pCamera->getProjectionMatrix());
+    getContext()->draw(sphereMarker, simpleVFormat);
+    }*/
+
+    /*float angleOffset = 0;//in rounds
+    pointlights[0]->position = glm::vec3(100.f * sin(fmod<float>(static_cast<float>(getAbosulteTime()) / 2.f, 3.1415f * 2.f + angleOffset)), 550, 100.f * cos(fmod<float>(static_cast<float>(getAbosulteTime()) / 2.f, 3.1415f * 2.f + angleOffset)));
+    angleOffset = 1.f / 3.f;
+    //pointlights[1]->position = glm::vec3(100.f * sin(fmod<float>(static_cast<float>(getAbosulteTime()) / 3.f, 3.1415f * 2.f + angleOffset)), 700, 100.f * cos(fmod<float>(static_cast<float>(getAbosulteTime()) / 3.f, 3.1415f * 2.f + angleOffset)));
+    angleOffset = 2.f / 3.f;
+    pointlights[2]->position = glm::vec3(100.f * sin(fmod<float>(static_cast<float>(getAbosulteTime()) * 1.f, 3.1415f * 2.f + angleOffset)), 450, 100.f * sin(fmod<float>(static_cast<float>(getAbosulteTime()) * 1.f, 3.1415f * 2.f + angleOffset)));*/
+    
+    //pointlights[0]->position = glm::vec3(0,1000,0);
+    //pointlights[0]->color = glm::vec3(0.8, 0.8, 0.8);
+
+    for (auto light : pointlights)
+    {
+<<<<<<< HEAD
+	    light->updatePath(getAbosulteTime() / 20.0f);
+	    pipeline.setMatrices(glm::translate(glm::mat4(1),light->position), pCamera->getWorldMatrix(), pCamera->getProjectionMatrix());
+	    getContext()->draw(sphereMarker, simpleVFormat);
+=======
+	  light->updatePath(getAbosulteTime() / 8.0f);
+	  pipeline.setMatrices(glm::translate(glm::mat4(1),light->position), pCamera->getWorldMatrix(), pCamera->getProjectionMatrix());
+	  getContext()->draw(sphereMarker, simpleVFormat);
+>>>>>>> 5d61e9e365771e7b351be5d8ccb55c05168372aa
+    }
+	check_gl_error();
+
+	pipeline.setMatrices(glm::mat4(1), pCamera->getWorldMatrix(), pCamera->getProjectionMatrix());
+    pipeline.GetPassthroughShaderAnimated()->bind();
+    pHellknight->SetRenderingTechnique(pipeline.GetPassthroughShaderAnimated());
+    pipeline.GetPassthroughShaderAnimated()->setUniform("gBoneMatrix", finalTransform);
+    pipeline.GetPassthroughShaderAnimated()->setUniform("gWorld", transform);
+    pipeline.GetPassthroughShaderAnimated()->setUniform("gNormal", glm::mat3(glm::transpose(glm::inverse(transform))));
+    pipeline.GetPassthroughShaderAnimated()->setUniform("gWVP", pCamera->getProjectionMatrix() * pCamera->getWorldMatrix() * transform);
+    pHellknight->draw(getContext());
+
+    // draw sponza
+    pipeline.GetPassthroughShader()->bind();
+    
+    if (pCamera->inFrustum(*pSceneShape))
+      pSceneShape->draw(getContext());
+
+	// draw camera trail
+	pCamera->drawTrail(getContext());
+	for (auto light : pointlights)
+	{
+		light->drawTrail(getContext());
+	}
+
+    pipeline.setMatrices(glm::translate(glm::mat4(1), glm::vec3(50, 0, -200)), pCamera->getWorldMatrix(), pCamera->getProjectionMatrix());
+    getContext()->draw(sphereMarker, simpleVFormat);
+    check_gl_error();
+    // std::cout << pCamera->getNumberOfShownObjects() << std::endl;
+    pipeline.endGeometryPass();
+
+    for (Candy::Scene::Pointlight* light : pointlights) // l = 0; l < pointlights.size(); l++)
+    {
+	  /*pipeline.setMatrices/, pCamera->getWorldMatrix(), pCamera->getProjectionMatrix());*/
+      for (unsigned dir = 0; dir < 6; dir++)
+      {
+        pipeline.beginShadowPass(*light, dir, pCamera->getWorldMatrix(), pCamera->getProjectionMatrix());
+		pipeline.GetShadowpassShader()->setUniform("modelMatrix", glm::mat4(1));
+		light->update((Candy::Scene::PointlightDirections)dir);
+		check_gl_error();
+
+        for (unsigned int n = 0; n < pSceneShape->m_vpMeshParts.size(); n++)
+        {
+			    if (light->inFrustum(*pSceneShape->m_vpMeshParts[n], dir))
+				    getContext()->draw(pSceneShape->m_vpMeshParts[n], pSceneShape->m_pVertexFormat, Candy::PrimitiveMode::TRIANGLES);
+        }
+
+        /*pipeline.GetShadowpassShader()->setUniform("modelMatrix", glm::translate(glm::mat4(1), glm::vec3(50, 0, 200)));
+        //pipeline.setMatrices(glm::translate(glm::mat4(1), glm::vec3(100,0,100)), pCamera->getWorldMatrix(), pCamera->getProjectionMatrix());
+        getContext()->draw(sphereMarker, simpleVFormat);*/
+
+        pipeline.GetShadowpassShaderAnimated()->bind();
+        pipeline.GetShadowpassShaderAnimated()->setUniform("gBoneMatrix", finalTransform);
+        pipeline.GetShadowpassShaderAnimated()->setUniform("gWorld", transform);
+        pipeline.GetShadowpassShaderAnimated()->setUniform("gNormal", glm::mat3(glm::transpose(glm::inverse(transform))));
+        pipeline.GetShadowpassShaderAnimated()->setUniform("gWVP", light->getMVP((Candy::Scene::PointlightDirections)dir) * transform);
+		pipeline.GetShadowpassShaderAnimated()->setUniform("lightpos", light->position);
+        for (unsigned int n = 0; n < pHellknight->m_vpMeshParts.size(); n++)
+        {
+			getContext()->draw(pHellknight->m_vpMeshParts[n], pHellknight->m_pVertexFormat, Candy::PrimitiveMode::TRIANGLES);
+        }
+        pipeline.endShadowPass(getContext(), *light, dir);
+        check_gl_error();
+      }
+
+      /*glBindTexture(GL_TEXTURE_CUBE_MAP, light->m_shadowMapBlurred);
+      glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+      glBindTexture(GL_TEXTURE_CUBE_MAP, 0);*/
+    }
+    //return;
+    
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+
+    check_gl_error();
+    //pipeline.drawCubeMap(pCamera->getViewMatrix(), pCamera->getProjectionMatrix());
+
+    pipeline.beginLightingPass();
+    check_gl_error();
+
+    deferred_passthrough_shader.bind();
+
+    pipeline.bindTextures();
+    check_gl_error();
+
+    auto camPos = pCamera->getPosition();
+    //std::cout << tmp.x << " " << tmp.y << " " << tmp.z << " " << std::endl;
+
+    for (auto* light : pointlights)
+    {
+      deferred_passthrough_shader.setUniform("cameraPos", pCamera->getPosition());
+		  deferred_passthrough_shader.setUniform("lightpos", light->position);
+      deferred_passthrough_shader.setUniform("lightcolor", light->getColor());
+      deferred_passthrough_shader.setUniform("framebuffer_dim", glm::vec2(width, height));
+      check_gl_error();
+
+      int loc = deferred_passthrough_shader.getUniformByName("shadowTex");
+      //assert(loc > -1);
+      glActiveTexture(GL_TEXTURE0 + 12);
+      glBindTexture(GL_TEXTURE_CUBE_MAP, light->m_shadowMap);
+      glUniform1i(loc, 12);
+
+      pipeline.endLightingPass(getContext());
+      check_gl_error();
+    }
+    
+    glDisable(GL_BLEND);
+    //glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+	
+	pipeline.runPostprocess(*getContext());
+	check_gl_error();
+
+    pipeline.displayColorbuffer();
+	check_gl_error();
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+
+    check_gl_error();
+  }
+
+private:
+  Candy::Scene::Camera*		pCamera;
+  Candy::Scene::SceneShape*	pSceneShape;
+  Candy::Scene::SceneShape*	pHellknight;
+  Candy::MeshLoader			meshLoader; 
+  Candy::GL::GLProgram deferred_passthrough_shader;
+  Candy::GL::GLProgram phong_tess;
+  glm::mat4 model1,view,projection;
+
+  Candy::DeferredPipeline pipeline;
+
+  Candy::VertexFormat* simpleVFormat;
+  Candy::GeometryBuffer* sphereMarker, cubeMarker;
+
+  std::vector<Candy::Scene::Pointlight*> pointlights;
+
+  Assimp::Importer importer;
+  std::vector<glm::mat4> bones;
+  std::vector<std::string> bonenames;
+  aiAnimation* anim;
+  aiNode* rootnode;
+
+  int width,
+	  height,
+	  shadowMapSize;
+
+  irrklang::ISoundEngine* soundEngine;
+};
+
+void TestApp::InitCamera()
+{
+	/*camera_path.positions.push_back(glm::vec3(-661.78, -10.26, -882.08));
+	  camera_path.positions.push_back(glm::vec3(362.92, -39.25, -245.24));
+
+	  camera_path.directions.push_back(glm::vec3(-0.6731, -0.0591, 0.737176));
+	  camera_path.directions.push_back(glm::vec3(-0.60772, 0.023821, -0.793794));*/
+
+	pCamera = getContext()->getCamera();
+
+	pCamera->addNodeToPath({ 1019.03, 79.69, 438.92 }, { 0.038276, 0.07912, 0.99613 });
+	pCamera->addNodeToPath({ 1040.09, 39.9, -441.71 }, { 0.996851, -0.0791206, -0.005292 });
+	pCamera->addNodeToPath({ -1144.95, 71.24, -466.38 }, { -0.0045, -0.0192, -0.9998 });
+	pCamera->addNodeToPath({ -1157.7, 67.895, 352.27 }, { -0.99888, -0.0391934, 0.0262631 });
+	pCamera->addNodeToPath({ 1019.03, 79.69, 438.92 }, { 0.038276, 0.07912, 0.99613 });
+	pCamera->addNodeToPath({ 1019.03, 79.69, 0 }, { 0.996851, -0.0791206, -0.005292 });
+	pCamera->addNodeToPath({ 0, 79.69, 0 }, { 0.996851, -0.0791206, -0.005292 });
+
+	pCamera->genTrail();
+
+	/*camera_path.directions.push_back({ 0.038276, 0.07912, 0.99613 });
+	camera_path.directions.push_back({ 0.038276, 0.07912, 0.99613 });
+	camera_path.directions.push_back({ 0.038276, 0.07912, 0.99613 });*/
+}
+
+void TestApp::InitLights()
+{
+	Candy::Scene::Pointlight* light0 = new Candy::Scene::Pointlight();
+	light0->initialize(shadowMapSize);
+	glm::vec3 direction(0);
+	light0->color = glm::vec3(1, 0.7, 0.7) / 4.f; //using color instead of direction
+	light0->addNodeToPath({ 1123.5, 250, 450.83 }, direction);
+	light0->addNodeToPath({ 1116.44, 250, -407.07 }, direction);
+	light0->addNodeToPath({ -1203.5, 250, -405.12 }, direction);
+	light0->addNodeToPath({ -1203.5, 250, 449.86 }, direction);
+	light0->addNodeToPath({ 1123.5, 250, 450.83 }, direction);
+	light0->addNodeToPath({ 1123.5, 250, 0}, direction);
+	light0->addNodeToPath({ 0, 250, 0 }, direction);
+
+	Candy::Scene::Pointlight* light1 = new Candy::Scene::Pointlight();
+	light1->initialize(shadowMapSize);
+	light1->color = glm::vec3(0.7, 1, 0.7) / 4.f;
+	light1->addNodeToPath({ 1116.44, 250, -407.07 }, direction);
+	light1->addNodeToPath({ -1203.5, 250, -405.12 }, direction);
+	light1->addNodeToPath({ -1203.5, 250, 449.86 }, direction);
+	light1->addNodeToPath({ 1123.5, 250, 450.83 }, direction);
+	light1->addNodeToPath({ 1116.44, 250, -407.07 }, direction);
+	light1->addNodeToPath({ 1116.44, 250, 0 }, direction);
+	light1->addNodeToPath({ 0, 250, 0 }, direction);
+
+
+	Candy::Scene::Pointlight* light2 = new Candy::Scene::Pointlight();
+	light2->initialize(shadowMapSize);
+	light2->color = glm::vec3(0.7, 0.7, 1) / 4.f;
+	
+	light2->addNodeToPath({ -1203.5, 250, -405.12 }, direction);
+	light2->addNodeToPath({ -1203.5, 250, 449.86 }, direction);
+	light2->addNodeToPath({ 1123.5, 250, 450.83 }, direction);
+	light2->addNodeToPath({ 1116.44, 250, -407.07 }, direction);
+	light2->addNodeToPath({ -1203.5, 250, -405.12 }, direction);
+	light2->addNodeToPath({ -1203.5, 250, -0 }, direction);
+	light2->addNodeToPath({ 0, 250, 0 }, direction);
+
+	Candy::Scene::Pointlight* light3 = new Candy::Scene::Pointlight();
+	light3->initialize(shadowMapSize);
+	light3->color = glm::vec3(0.7, 0.7, 1) / 4.f;
+	light3->addNodeToPath({ -1203.5, 250, 449.86 }, direction);
+	light3->addNodeToPath({ 1123.5, 250, 450.83 }, direction);
+	light3->addNodeToPath({ 1116.44, 250, -407.07 }, direction);
+	light3->addNodeToPath({ -1203.5, 250, -405.12 }, direction);
+	light3->addNodeToPath({ -1203.5, 250, 449.86 }, direction);
+	light3->addNodeToPath({ -1203.5, 250, 0 }, direction);
+	light3->addNodeToPath({ 0, 250, 0 }, direction);
+
+	
+	
+
+	pointlights.push_back(light0);
+	/*pointlights.push_back(light1);
+	pointlights.push_back(light2);
+	pointlights.push_back(light3);*/
+
+	for (auto light : pointlights)
+	{
+		light->genTrail();
+	}
+}
+
+int main()
+{
+  TestApp app;
+  app.run();
+  return 0;
+}

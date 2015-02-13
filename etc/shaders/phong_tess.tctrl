@@ -1,0 +1,60 @@
+#version 430 core
+
+layout(vertices = 3) out;
+
+in vec3 vPosition[];
+in vec3 vNormal[];
+in vec2 vTexcoord[];
+
+out vec3 tcPosition[];
+out vec3 tcNormal[];
+out vec2 tcTexcoord[];
+
+uniform float TessLevelInner = 3;
+uniform float TessLevelOuter = 3;
+uniform mat4 view;
+
+#define ID gl_InvocationID
+
+float GetTessLevel(float Distance0, float Distance1);
+
+void main()
+{
+    tcPosition[ID] = vPosition[ID];
+    tcNormal[ID] = vNormal[ID];
+	tcTexcoord[ID] = vTexcoord[ID];
+
+    /*vec3 eye = vec3(inverse(view) * vec4(0,0,0,1));
+
+    float EyeToVertexDistance0 = distance(eye, tcPosition[0]);
+    float EyeToVertexDistance1 = distance(eye, tcPosition[1]);
+    float EyeToVertexDistance2 = distance(eye, tcPosition[2]);
+
+    gl_TessLevelOuter[0] = GetTessLevel(EyeToVertexDistance1, EyeToVertexDistance2);
+    gl_TessLevelOuter[1] = GetTessLevel(EyeToVertexDistance2, EyeToVertexDistance0);
+    gl_TessLevelOuter[2] = GetTessLevel(EyeToVertexDistance0, EyeToVertexDistance1);
+    gl_TessLevelInner[0] = gl_TessLevelOuter[2];*/
+	
+	gl_TessLevelOuter[0] = 3;
+	gl_TessLevelOuter[1] = 3;
+	gl_TessLevelOuter[2] = 3;
+	gl_TessLevelInner[0] = 3;
+}
+
+float GetTessLevel(float Distance0, float Distance1)
+{
+	float dstMax = 300;
+	float tessMax = 5;
+	float tessMin = 1;
+
+    float AvgDistance = (Distance0 + Distance1) / 2.0;
+
+	if(AvgDistance > dstMax)
+	{		
+		return tessMin;
+	}
+	else
+	{
+		return (1-AvgDistance/dstMax)*(tessMax-tessMin);	
+	}
+}
